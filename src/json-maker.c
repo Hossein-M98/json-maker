@@ -305,13 +305,85 @@ ALL_TYPES
 ALL_TYPES
 #undef X
 
-char* json_double( char* dest, char const* name, double value, size_t* remLen ) {
-    return json_verylong( dest, name, value, remLen );
+#ifndef JSON_DBL_PREC
+#define JSON_DBL_PREC 6   /* Default fractional precision for double output */
+#endif
+
+/* Simple check for finiteness: true if neither NaN nor Inf */
+static int json_isfinite(double x) {
+    return (x == x) && ((x - x) == 0.0); /* NaN != NaN and Inf - Inf → NaN */
+}
+
+/* Precomputed powers of ten for fractional scaling */
+static const unsigned long long json_pow10[] = {
+    1ULL, 10ULL, 100ULL, 1000ULL, 10000ULL, 100000ULL,
+    1000000ULL, 10000000ULL, 100000000ULL, 1000000000ULL,
+    10000000000ULL, 100000000000ULL, 1000000000000ULL,
+    10000000000000ULL, 100000000000000ULL, 1000000000000000ULL,
+};
+
+/* Write the fractional digits with zero padding up to `prec` digits */
+static char* json_write_frac_fixed(char* dest,
+                                   unsigned long long frac_scaled,
+                                   int prec,
+                                   size_t* remLen) {
+    for (int i = prec - 1; i >= 0; --i) {
+        unsigned long long div = json_pow10[i];
+        char d = (char)('0' + (char)((frac_scaled / div) % 10ULL));
+        dest = chtoa(dest, d, remLen);
+    }
+    return dest;
+}
+
+char* json_double(char* dest, char const* name, double value, size_t* remLen) {
+    dest = primitivename(dest, name, remLen);
+
+    if (!json_isfinite(value)) {
+        /* JSON does not support NaN/Infinity → map to null */
+        dest = atoa(dest, "null,", remLen);
+        return dest;
+    }
+
+    /* Handle sign */
+    if (value < 0) {
+        dest = chtoa(dest, '-', remLen);
+        value = -value;
+    }
+
+    /* Split into integer and fractional part */
+    unsigned long long ipart = (unsigned long long)value;
+    double frac = value - (double)ipart;
+
+    int prec = (JSON_DBL_PREC < (int)(sizeof(json_pow10)/sizeof(json_pow10[0]))-1)
+               ? JSON_DBL_PREC
+               : (int)(sizeof(json_pow10)/sizeof(json_pow10[0]))-1;
+
+    unsigned long long scale = json_pow10[prec];
+    /* +0.5 for rounding */
+    unsigned long long fscaled = (unsigned long long)(frac * (double)scale + 0.5);
+
+    /* Handle fractional overflow, e.g. 0.999999 → 1.000000 */
+    if (fscaled >= scale) {
+        fscaled = 0;
+        ++ipart;
+    }
+
+    /* Write integer part */
+    dest = uverylongtoa(dest, ipart, remLen);
+
+    if (prec > 0) {
+        dest = chtoa(dest, '.', remLen);
+        dest = json_write_frac_fixed(dest, fscaled, prec, remLen);
+    }
+
+    dest = chtoa(dest, ',', remLen);
+    return dest;
 }
 
 #else
 
 #include <stdio.h>
+#include <math.h>
 
 #define ALL_TYPES                                   \
     X( json_int,       int,                "%d"   ) \
@@ -319,8 +391,7 @@ char* json_double( char* dest, char const* name, double value, size_t* remLen ) 
     X( json_uint,      unsigned int,       "%u"   ) \
     X( json_ulong,     unsigned long,      "%lu"  ) \
     X( json_verylong,  long long,          "%lld" ) \
-    X( json_uverylong, unsigned long long, "%llu" ) \
-    X( json_double,    double,             "%g"   )
+    X( json_uverylong, unsigned long long, "%llu" )
 
 
 #define json_num( funcname, type, fmt )                                             \
@@ -340,5 +411,32 @@ char* funcname( char* dest, char const* name, type value, size_t* remLen  ) {   
 ALL_TYPES
 #undef X
 
+char* json_double(char* dest, char const* name, double value, size_t* remLen) {
+    dest = primitivename(dest, name, remLen);
+
+    if (!isfinite(value)) {
+        dest = atoa(dest, "null,", remLen);
+        return dest;
+    }
+
+    /* Use high precision for JSON serialization */
+    int wrote = snprintf(dest, *remLen, "%.17g", value);
+
+    if (wrote < 0) {
+        /* snprintf error → fallback to null */
+        dest = atoa(dest, "null,", remLen);
+        return dest;
+    } else if ((size_t)wrote >= *remLen) {
+        /* Output was truncated: snprintf wrote *remLen-1 chars + NUL */
+        dest += *remLen - 1;
+        *remLen = 1;
+    } else {
+        dest += wrote;
+        *remLen -= (size_t)wrote;
+    }
+
+    dest = chtoa(dest, ',', remLen);
+    return dest;
+}
 
 #endif
